@@ -1,0 +1,119 @@
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+// --- PIN DEFINITIONS ---
+#define EN_PIN     7
+#define DAC_PIN    A0
+
+// --- CONSTANTS ---
+const float VOUT_TARGET = 8.0;   
+const float DEADBAND_W  = 0.05;  
+const float DAC_MIN     = 0.2;   
+const float DAC_MAX     = 4.8;   
+const uint16_t MPPT_HZ  = 100;   
+
+// --- SYSTEM STATES ---
+enum SystemState { STANDBY, MPPT_MODE, CV_MODE };
+SystemState currentState = STANDBY;
+
+// --- GLOBALS ---
+float Vdac = 2.5;                
+float lastPower = 0;
+float lastVoltage = 0;
+unsigned long tMPPT = 0;
+unsigned long tLog  = 0;
+
+Adafruit_INA219 inaPV1(0x40);    
+Adafruit_INA219 inaLoad(0x43);   
+
+void setDAC(float voltage) {
+  Vdac = constrain(voltage, DAC_MIN, DAC_MAX);
+  int dacValue = (Vdac / 5.0) * 4095;
+  analogWrite(DAC_PIN, dacValue);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(400000); 
+
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, LOW); 
+
+  analogWriteResolution(12); 
+  
+  if (!inaPV1.begin() || !inaLoad.begin()) {
+    Serial.println("INA219 Error!");
+    while (1);
+  }
+  
+  inaPV1.setCalibration_32V_2A();
+  inaLoad.setCalibration_32V_2A();
+  
+  Serial.println("MPPT System Initialized.");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  float vIn = inaPV1.getBusVoltage_V();
+  float pIn = (vIn * inaPV1.getCurrent_mA()) / 1000.0;
+  float vOut = inaLoad.getBusVoltage_V();
+
+  if (now - tMPPT > (1000 / MPPT_HZ)) {
+    tMPPT = now;
+
+    switch (currentState) {
+      case STANDBY:
+        if (vIn > 5.5) { 
+          digitalWrite(EN_PIN, HIGH);
+          currentState = MPPT_MODE;
+        }
+        break;
+
+      case MPPT_MODE:
+        if (vIn < 4.5) { 
+          digitalWrite(EN_PIN, LOW);
+          currentState = STANDBY;
+          break;
+        }
+        if (vOut >= VOUT_TARGET) { 
+          currentState = CV_MODE;
+          break;
+        }
+        
+        float dP = pIn - lastPower;
+        float dV = vIn - lastVoltage;
+        float step = constrain(0.15 * fabs(dP), 0.01, 0.25); 
+
+        if (fabs(dP) > DEADBAND_W) {
+          if (dP > 0) {
+            Vdac += (dV > 0) ? step : -step;
+          } else {
+            Vdac += (dV > 0) ? -step : step;
+          }
+        }
+        setDAC(Vdac);
+        break;
+
+      case CV_MODE:
+        if (vOut < (VOUT_TARGET - 0.1)) {
+          currentState = MPPT_MODE;
+          break;
+        }
+        Vdac -= (VOUT_TARGET - vOut) * 0.1;
+        setDAC(Vdac);
+        break;
+    }
+    lastPower = pIn;
+    lastVoltage = vIn;
+  }
+
+  if (now - tLog > 1000) {
+    tLog = now;
+    Serial.print("V_In: "); Serial.print(vIn);
+    Serial.print("V | P_In: "); Serial.print(pIn);
+    Serial.print("W | V_Out: "); Serial.print(vOut);
+    Serial.print("V | State: "); Serial.println(currentState);
+  }
+}
