@@ -1,0 +1,88 @@
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+// --- PIN DEFINITIONS ---
+#define EN_PIN     7
+#define DAC_PIN    A0
+
+// --- CONSTANTS ---
+const float HARD_OVERVOLTAGE_LIMIT = 8.5; // Kills converter if output goes too high
+
+// --- GLOBALS ---
+float Vdac = 0.0; // Start at 0V
+Adafruit_INA219 inaInput(0x40);  
+Adafruit_INA219 inaOutput(0x43); 
+
+void setDAC(float voltage) {
+  // Constrain just to be safe with the Arduino R4 Minima DAC limits
+  Vdac = constrain(voltage, 0.0, 4.8);
+  int dacValue = (Vdac / 5.0) * 4095;
+  analogWrite(DAC_PIN, dacValue);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, HIGH); // Force converter ON for static testing
+
+  analogWriteResolution(12);
+  setDAC(0.0); // Initialize DAC to 0
+  
+  if (!inaInput.begin() || !inaOutput.begin()) {
+    Serial.println("Error finding INA219 chips. Check wiring!");
+    while (1);
+  }
+  
+  inaInput.setCalibration_32V_2A();
+  inaOutput.setCalibration_32V_2A();
+  
+  Serial.println("=== STATIC HARDWARE TEST MODE ===");
+  Serial.println("Type a DAC voltage (0.0 to 4.8) in the Serial Monitor and press Enter.");
+}
+
+void loop() {
+  // 1. Read from Serial Monitor to set DAC
+  if (Serial.available() > 0) {
+    float inputVal = Serial.parseFloat();
+    
+    // Clear the rest of the serial buffer (newlines, carriage returns)
+    while(Serial.available() > 0) { Serial.read(); }
+    
+    if (inputVal >= 0.0 && inputVal <= 4.8) {
+      setDAC(inputVal);
+      Serial.print(">>> DAC set to: ");
+      Serial.print(Vdac);
+      Serial.println(" V <<<");
+    } else {
+      Serial.println("Invalid input. Enter a value between 0.0 and 4.8.");
+    }
+  }
+
+  // 2. Read Sensors
+  float vIn = inaInput.getBusVoltage_V();
+  float iIn = inaInput.getCurrent_mA();
+  float vOut = inaOutput.getBusVoltage_V();
+  float iOut = inaOutput.getCurrent_mA();
+
+  // 3. Safety Cutoff
+  if (vOut >= HARD_OVERVOLTAGE_LIMIT) {
+    digitalWrite(EN_PIN, LOW); // Kill power immediately
+    setDAC(0.0);
+    Serial.println("!!! OVERVOLTAGE LIMIT REACHED - CONVERTER DISABLED !!!");
+    while(1); // Halt the program to prevent damage
+  }
+
+  // 4. Print Telemetry (every 1 second)
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    lastPrint = millis();
+    Serial.print("DAC: "); Serial.print(Vdac, 2);
+    Serial.print("V | IN: "); Serial.print(vIn, 2);
+    Serial.print("V, "); Serial.print(iIn, 0);
+    Serial.print("mA | OUT: "); Serial.print(vOut, 2);
+    Serial.print("V, "); Serial.print(iOut, 0);
+    Serial.println("mA");
+  }
+}
