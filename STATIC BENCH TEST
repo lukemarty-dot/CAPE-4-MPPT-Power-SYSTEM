@@ -1,88 +1,223 @@
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 
-// --- PIN DEFINITIONS ---
-#define EN_PIN     7
-#define DAC_PIN    A0
+// =============================================================================
+// PIN DEFINITIONS
+// =============================================================================
+#define EN_PIN  7    // Arduino D7 controls TPS63070 EN pin
+#define DAC_PIN A0   // Arduino A0 true 12-bit DAC feeds R_DAC to FB node
 
-// --- CONSTANTS ---
-const float HARD_OVERVOLTAGE_LIMIT = 8.5; // Kills converter if output goes too high
+// =============================================================================
+// RESISTOR NETWORK CONSTANTS (from TI SLAAE59 methodology)
+// These values were calculated to give full 2.5V-9V output control
+// with the SparkFun TPS63070 breakout board's fixed R2 = 68.1k
+//
+// R1 = 560k  (soldered from VOUT pin to CUST/FB pad)
+//   - Pre-biases FB node from VOUT, replicates TI reference design R1
+//   - Without this, DAC has no stable operating point to work against
+//
+// R2 = 68.1k (already on SparkFun board, do not modify)
+//   - Fixed resistor from FB to GND on the breakout board
+//
+// R_DAC = 270k (in series between A0 and CUST/FB pad)
+//   - Isolates DAC output impedance from FB node
+//   - Prevents DAC from fighting TPS63070 internal compensation
+//   - Acts as TI's R3 in their reference design
+//
+// C_filter = 10nF (from CUST/FB pad to GND, as close to pad as possible)
+//   - Filters 2.4MHz switching noise from coupling into FB
+//   - Without this, breadboard parasitics corrupt the feedback signal
+//
+// DAC VOLTAGE TO VOUT MAPPING (calculated):
+//   DAC = 0.0V  →  Vout ≈ 9.0V  (maximum)
+//   DAC = 1.65V →  Vout ≈ 5.75V (midpoint)
+//   DAC = 3.3V  →  Vout ≈ 2.5V  (minimum)
+//   Relationship is LINEAR and INVERSE - higher DAC = lower Vout
+// =============================================================================
 
-// --- GLOBALS ---
-float Vdac = 0.0; // Start at 0V
-Adafruit_INA219 inaInput(0x40);  
-Adafruit_INA219 inaOutput(0x43); 
+// =============================================================================
+// SAFETY LIMITS
+// =============================================================================
+// Set slightly below TPS63070 absolute max of 9V to protect hardware
+const float HARD_OVERVOLTAGE_LIMIT = 8.5;
 
+// DAC voltage limits based on resistor network calculations
+// 0.0V = max Vout (9V), 3.3V = min Vout (2.5V)
+// We initialize at midpoint (1.65V) to prevent startup spike
+const float DAC_MIN = 0.0;
+const float DAC_MAX = 3.3;
+const float DAC_INIT = 1.65; // Midpoint = ~5.75V out, safe startup point
+
+// =============================================================================
+// GLOBALS
+// =============================================================================
+float Vdac = DAC_INIT;
+
+// INA219 sensors - verify your I2C addresses with a scanner if these fail
+// Address 0x40 = input sensor (monitors panel/supply side)
+// Address 0x43 = output sensor (monitors converter output side)
+Adafruit_INA219 inaInput(0x40);
+Adafruit_INA219 inaOutput(0x43);
+
+// =============================================================================
+// setDAC() - Sets the DAC output voltage
+// =============================================================================
+// IMPORTANT: The R4 Minima DAC is 12-bit (0-4095) with 0-3.3V range
+// We constrain to DAC_MAX (3.3V) because above that gives no additional
+// control benefit and risks pushing FB node out of stable operating range.
+// The old code used 5.0V as reference which was wrong for the R4 Minima's
+// 3.3V DAC - this is now corrected to 3.3V.
+// =============================================================================
 void setDAC(float voltage) {
-  // Constrain just to be safe with the Arduino R4 Minima DAC limits
-  Vdac = constrain(voltage, 0.0, 4.8);
-  int dacValue = (Vdac / 5.0) * 4095;
-  analogWrite(DAC_PIN, dacValue);
+  // Constrain to calculated safe operating range
+  // Below 0V is impossible, above 3.3V exceeds R4 Minima DAC range
+  Vdac = constrain(voltage, DAC_MIN, DAC_MAX);
+  
+  // Convert voltage to 12-bit DAC code
+  // R4 Minima DAC: 0-4095 maps to 0-3.3V (NOT 0-5V like old code)
+  // Old code used /5.0 which was incorrect and compressed your control range
+  int dacCode = (int)((Vdac / 3.3) * 4095);
+  
+  analogWrite(DAC_PIN, dacCode);
 }
 
+// =============================================================================
+// disableConverter() - Safe shutdown sequence
+// =============================================================================
+// Always reset DAC to midpoint before disabling EN
+// This ensures FB node is pre-biased correctly on next enable
+// and prevents the startup spike on re-enable
+// =============================================================================
+void disableConverter() {
+  setDAC(DAC_INIT);      // Pre-set DAC to safe midpoint
+  delay(10);             // Allow RC network (R_DAC + C_filter) to settle
+  digitalWrite(EN_PIN, LOW); // Now kill the converter
+}
+
+// =============================================================================
+// SETUP
+// =============================================================================
 void setup() {
   Serial.begin(115200);
   Wire.begin();
-  
-  pinMode(EN_PIN, OUTPUT);
-  digitalWrite(EN_PIN, HIGH); // Force converter ON for static testing
 
+  // Configure EN pin - start LOW (converter disabled) for safe startup
+  // Old code started EN HIGH immediately which caused startup spike
+  // because DAC was still at 0V when converter enabled
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, LOW);
+
+  // Set DAC resolution to 12-bit (0-4095)
   analogWriteResolution(12);
-  setDAC(0.0); // Initialize DAC to 0
-  
+
+  // Pre-set DAC to midpoint BEFORE enabling converter
+  // This pre-biases the FB node via R1/R_DAC network to ~5.75V operating point
+  // Prevents the startup spike that was triggering SafetyTrip at 0V DAC
+  setDAC(DAC_INIT);
+
+  // Wait for RC network to settle
+  // Time constant = R_DAC x C_filter = 270k x 10nF = 2.7ms
+  // Wait 10x that = 27ms minimum, use 100ms for safety margin
+  delay(100);
+
+  // Initialize INA219 sensors
   if (!inaInput.begin() || !inaOutput.begin()) {
-    Serial.println("Error finding INA219 chips. Check wiring!");
-    while (1);
+    Serial.println("ERROR: INA219 not found. Check I2C wiring and addresses.");
+    while (1); // Halt - no point continuing without sensors
   }
-  
+
   inaInput.setCalibration_32V_2A();
   inaOutput.setCalibration_32V_2A();
-  
-  Serial.println("=== STATIC HARDWARE TEST MODE ===");
-  Serial.println("Type a DAC voltage (0.0 to 4.8) in the Serial Monitor and press Enter.");
+
+  // Now safe to enable converter - FB node is pre-biased
+  digitalWrite(EN_PIN, HIGH);
+
+  // Brief settle time after enable before taking first readings
+  delay(50);
+
+  Serial.println("=====================================================");
+  Serial.println("  CAPE-4 MPPT - DAC COMMANDABLE CONVERTER TEST");
+  Serial.println("=====================================================");
+  Serial.println("Resistor network: R1=560k (VOUT->FB), R2=68.1k (FB->GND)");
+  Serial.println("                  R_DAC=270k (A0->FB), C=10nF (FB->GND)");
+  Serial.println("-----------------------------------------------------");
+  Serial.println("DAC VOLTAGE → VOUT MAPPING:");
+  Serial.println("  0.0V DAC  →  ~9.0V out (maximum)");
+  Serial.println("  1.65V DAC →  ~5.75V out (nominal)");
+  Serial.println("  3.3V DAC  →  ~2.5V out (minimum)");
+  Serial.println("-----------------------------------------------------");
+  Serial.println("Type a DAC voltage (0.0 to 3.3) and press Enter.");
+  Serial.println("Higher DAC voltage = LOWER output voltage.");
+  Serial.println("=====================================================");
 }
 
+// =============================================================================
+// LOOP
+// =============================================================================
 void loop() {
-  // 1. Read from Serial Monitor to set DAC
+
+  // ---------------------------------------------------------------------------
+  // 1. SERIAL INPUT - Accept DAC voltage command from user
+  // ---------------------------------------------------------------------------
   if (Serial.available() > 0) {
     float inputVal = Serial.parseFloat();
-    
-    // Clear the rest of the serial buffer (newlines, carriage returns)
-    while(Serial.available() > 0) { Serial.read(); }
-    
-    if (inputVal >= 0.0 && inputVal <= 4.8) {
+
+    // Flush remaining serial buffer (newlines, carriage returns)
+    while (Serial.available() > 0) { Serial.read(); }
+
+    if (inputVal >= DAC_MIN && inputVal <= DAC_MAX) {
       setDAC(inputVal);
       Serial.print(">>> DAC set to: ");
-      Serial.print(Vdac);
-      Serial.println(" V <<<");
+      Serial.print(Vdac, 2);
+      Serial.print("V  |  Expected Vout: ~");
+      // Linear interpolation to estimate expected Vout for user feedback
+      // 0.0V DAC = 9.0V out, 3.3V DAC = 2.5V out
+      float expectedVout = 9.0 - ((Vdac / 3.3) * (9.0 - 2.5));
+      Serial.print(expectedVout, 1);
+      Serial.println("V <<<");
     } else {
-      Serial.println("Invalid input. Enter a value between 0.0 and 4.8.");
+      Serial.print("Invalid input. Enter a value between ");
+      Serial.print(DAC_MIN);
+      Serial.print(" and ");
+      Serial.println(DAC_MAX);
     }
   }
 
-  // 2. Read Sensors
-  float vIn = inaInput.getBusVoltage_V();
-  float iIn = inaInput.getCurrent_mA();
+  // ---------------------------------------------------------------------------
+  // 2. READ SENSORS
+  // ---------------------------------------------------------------------------
+  float vIn  = inaInput.getBusVoltage_V();
+  float iIn  = inaInput.getCurrent_mA();
   float vOut = inaOutput.getBusVoltage_V();
   float iOut = inaOutput.getCurrent_mA();
 
-  // 3. Safety Cutoff
+  // ---------------------------------------------------------------------------
+  // 3. SAFETY CUTOFF
+  // Overvoltage check runs every loop iteration for fast response
+  // Does not rely on 1-second print timer
+  // ---------------------------------------------------------------------------
   if (vOut >= HARD_OVERVOLTAGE_LIMIT) {
-    digitalWrite(EN_PIN, LOW); // Kill power immediately
-    setDAC(0.0);
+    disableConverter(); // Safe shutdown - pre-sets DAC before killing EN
     Serial.println("!!! OVERVOLTAGE LIMIT REACHED - CONVERTER DISABLED !!!");
-    while(1); // Halt the program to prevent damage
+    Serial.print("Measured Vout at trip: ");
+    Serial.print(vOut, 2);
+    Serial.println("V");
+    Serial.println("Reset Arduino to restart. Check resistor network values.");
+    while (1); // Halt to prevent damage
   }
 
-  // 4. Print Telemetry (every 1 second)
+  // ---------------------------------------------------------------------------
+  // 4. TELEMETRY OUTPUT - Print every 1 second
+  // ---------------------------------------------------------------------------
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 1000) {
     lastPrint = millis();
-    Serial.print("DAC: "); Serial.print(Vdac, 2);
+    Serial.print("DAC: ");    Serial.print(Vdac, 2);
     Serial.print("V | IN: "); Serial.print(vIn, 2);
-    Serial.print("V, "); Serial.print(iIn, 0);
+    Serial.print("V, ");      Serial.print(iIn, 0);
     Serial.print("mA | OUT: "); Serial.print(vOut, 2);
-    Serial.print("V, "); Serial.print(iOut, 0);
-    Serial.println("mA");
+    Serial.print("V, ");      Serial.print(iOut, 0);
+    Serial.print("mA | Pout: "); Serial.print((vOut * iOut / 1000.0), 2);
+    Serial.println("W");
   }
 }
